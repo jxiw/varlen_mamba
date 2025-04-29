@@ -1,3 +1,7 @@
+# Mamba with data packing
+
+This version implements the packed Mamba and is modified from an excellent implementation [here](https://github.com/ptxu78/pack_mamba/tree/feat/pack_with_position_indices).
+
 # Mamba
 
 ![Mamba](assets/selection.png "Selective State Space")

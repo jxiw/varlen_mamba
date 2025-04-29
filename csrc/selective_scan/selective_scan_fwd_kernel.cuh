@@ -23,7 +23,7 @@
 
 template<int kNThreads_, int kNItems_, int kNRows_, bool kIsEvenLen_,
          bool kIsVariableB_, bool kIsVariableC_,
-         bool kHasZ_, typename input_t_, typename weight_t_>
+         bool kHasZ_, bool kUseIndex_, typename input_t_, typename weight_t_>
 struct Selective_Scan_fwd_kernel_traits {
     static_assert(kNItems_ % 4 == 0);
     using input_t = input_t_;
@@ -43,14 +43,19 @@ struct Selective_Scan_fwd_kernel_traits {
     static constexpr bool kIsVariableB = kIsVariableB_;
     static constexpr bool kIsVariableC = kIsVariableC_;
     static constexpr bool kHasZ = kHasZ_;
+    static constexpr bool kUseIndex = kUseIndex_;
 
     static constexpr bool kDirectIO = kIsEvenLen && kNLoads == 1;
+    static constexpr int kNLoadsIndex = kNItems / 4;
 
     using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
     using scan_t = std::conditional_t<!kIsComplex, float2, float4>;
     using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNItems, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
     using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, kNLoads,
         !kDirectIO ? cub::BLOCK_LOAD_WARP_TRANSPOSE : cub::BLOCK_LOAD_DIRECT>;
+    using BlockLoadIndexT = cub::BlockLoad<int, kNThreads, kNItems, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    using BlockLoadIndexVecT = cub::BlockLoad<uint4, kNThreads, kNLoadsIndex,
+        !(kIsEvenLen && kNLoadsIndex == 1) ? cub::BLOCK_LOAD_WARP_TRANSPOSE : cub::BLOCK_LOAD_DIRECT>;
     using BlockLoadWeightT = cub::BlockLoad<input_t, kNThreads, !kIsComplex ? kNItems : kNItems * 2, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
     using BlockLoadWeightVecT = cub::BlockLoad<vec_t, kNThreads, !kIsComplex ? kNLoads : kNLoads * 2,
         !kDirectIO ? cub::BLOCK_LOAD_WARP_TRANSPOSE  : cub::BLOCK_LOAD_DIRECT>;
@@ -76,6 +81,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     constexpr bool kIsVariableB = Ktraits::kIsVariableB;
     constexpr bool kIsVariableC = Ktraits::kIsVariableC;
     constexpr bool kHasZ = Ktraits::kHasZ;
+    constexpr bool kUseIndex = Ktraits::kUseIndex;
     constexpr int kNThreads = Ktraits::kNThreads;
     constexpr int kNItems = Ktraits::kNItems;
     constexpr int kNRows = Ktraits::kNRows;
@@ -92,6 +98,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_loadstorescan);
     auto& smem_load = reinterpret_cast<typename Ktraits::BlockLoadT::TempStorage&>(smem_);
     auto& smem_load_weight = reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage&>(smem_);
+    auto& smem_load_index = reinterpret_cast<typename Ktraits::BlockLoadIndexT::TempStorage&>(smem_);
     auto& smem_load_weight1 = *reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage*>(smem_ + sizeof(typename Ktraits::BlockLoadWeightT::TempStorage));
     auto& smem_store = reinterpret_cast<typename Ktraits::BlockStoreT::TempStorage&>(smem_);
     auto& smem_scan = *reinterpret_cast<typename Ktraits::BlockScanT::TempStorage*>(smem_ + Ktraits::kSmemIOSize);
@@ -112,6 +119,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     weight_t *C = reinterpret_cast<weight_t *>(params.C_ptr) + dim_id * kNRows * params.C_d_stride;
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
     scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate;
+    int *index = !kUseIndex ? nullptr :reinterpret_cast<int *>(params.index_ptr) + batch_id * params.seqlen;
 
     float D_val[kNRows] = {0};
     if (params.D_ptr != nullptr) {
@@ -136,6 +144,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     constexpr int kChunkSize = kNThreads * kNItems;
     for (int chunk = 0; chunk < params.n_chunks; ++chunk) {
         input_t u_vals[kNRows][kNItems], delta_vals_load[kNRows][kNItems];
+        int index_vals_load[kNRows][kNItems];
         __syncthreads();
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
@@ -145,6 +154,13 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             load_input<Ktraits>(u + r * params.u_d_stride, u_vals[r], smem_load, params.seqlen - chunk * kChunkSize);
             if constexpr (!kDirectIO) { __syncthreads(); }
             load_input<Ktraits>(delta + r * params.delta_d_stride, delta_vals_load[r], smem_load, params.seqlen - chunk * kChunkSize);
+            if constexpr (kUseIndex) {
+                __syncthreads();
+                load_index<Ktraits>(index + r * params.delta_d_stride, index_vals_load[r], smem_load_index, params.seqlen - chunk * kChunkSize);
+            }
+        }
+        if constexpr (kUseIndex) {
+            index += kChunkSize;
         }
         u += kChunkSize;
         delta += kChunkSize;
@@ -220,6 +236,12 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                     if constexpr (!kIsComplex) {
                         thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
                                                      !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
+                        // Reset A bar for cumulative sequences (Real)
+                        if constexpr (kUseIndex) {
+                            if (index_vals_load[r][i] == 0) {
+                                thread_data[i].x = 0.f;
+                            }
+                        }
                         if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 thread_data[i] = make_float2(1.f, 0.f);
@@ -230,6 +252,12 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                         complex_t delta_a_exp = cexp2f(delta_vals[r][i] * A_val[r]);
                         weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
                         thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, B_delta_u_val.real_, B_delta_u_val.imag_);
+                        if constexpr (kUseIndex) {
+                            if (index_vals_load[r][i] == 0) {
+                                thread_data[i].x = 0.f;
+                                thread_data[i].y = 0.f;
+                            }
+                        }
                         if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 thread_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
@@ -316,31 +344,33 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
         BOOL_SWITCH(params.is_variable_B, kIsVariableB, [&] {
             BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] {
                 BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] {
-                    using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, input_t, weight_t>;
-                    
-                    constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
-                    dim3 grid(params.batch, params.dim / kNRows);
+                    BOOL_SWITCH(params.index_ptr != nullptr , kUseIndex, [&] {
+                        using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, kUseIndex, input_t, weight_t>;
+                        
+                        constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
+                        dim3 grid(params.batch, params.dim / kNRows);
 
-                    // Had to change this substantially since potentially the hip 
-                    // interface for setting kernel launch attributes is slightly different from 
-                    // cuda's. In particualar, it seems to expect a plain const void * pointer.
+                        // Had to change this substantially since potentially the hip 
+                        // interface for setting kernel launch attributes is slightly different from 
+                        // cuda's. In particualar, it seems to expect a plain const void * pointer.
 
-                    auto kernel = &selective_scan_fwd_kernel<Ktraits>;
+                        auto kernel = &selective_scan_fwd_kernel<Ktraits>;
 
-                    
-                    if (kSmemSize >= 48 * 1024) {
-                        #ifndef USE_ROCM
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                        #else
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
-                            (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                            std::cerr << "Warning (selective_scan_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
-                        #endif
-                    }
+                        
+                        if (kSmemSize >= 48 * 1024) {
+                            #ifndef USE_ROCM
+                            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                            #else
+                            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                                std::cerr << "Warning (selective_scan_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
+                            #endif
+                        }
 
-                    kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                        kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+                        C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    });
                 });
             });
         });
