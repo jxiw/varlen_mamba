@@ -21,9 +21,25 @@
 #include "selective_scan_common.h"
 #include "static_switch.h"
 
+__device__ __forceinline__
+int upper_bound_dev(const int* __restrict__ first, int count, int value)
+{
+    int left  = 0;
+    int right = count;                 // one past the last valid index
+    while (left < right) {
+        int mid = (left + right) >> 1; // mid = floor((l+r)/2)
+        int mid_val = first[mid];
+        if (value < mid_val)
+            right = mid;               // keep left half (value < mid_val)
+        else
+            left  = mid + 1;           // skip left half incl. mid
+    }
+    return left;                       // first element > value
+}
+
 template<int kNThreads_, int kNItems_, int kNRows_, bool kIsEvenLen_,
          bool kIsVariableB_, bool kIsVariableC_,
-         bool kHasZ_, bool kUseIndex_, typename input_t_, typename weight_t_>
+         bool kHasZ_, bool kUseIndex_, bool kReturnSSMState_, typename input_t_, typename weight_t_>
 struct Selective_Scan_fwd_kernel_traits {
     static_assert(kNItems_ % 4 == 0);
     using input_t = input_t_;
@@ -44,6 +60,7 @@ struct Selective_Scan_fwd_kernel_traits {
     static constexpr bool kIsVariableC = kIsVariableC_;
     static constexpr bool kHasZ = kHasZ_;
     static constexpr bool kUseIndex = kUseIndex_;
+    static constexpr bool kReturnSSMState = kReturnSSMState_;
 
     static constexpr bool kDirectIO = kIsEvenLen && kNLoads == 1;
     static constexpr int kNLoadsIndex = kNItems / 4;
@@ -82,6 +99,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     constexpr bool kIsVariableC = Ktraits::kIsVariableC;
     constexpr bool kHasZ = Ktraits::kHasZ;
     constexpr bool kUseIndex = Ktraits::kUseIndex;
+    constexpr bool kReturnSSMState = Ktraits::kReturnSSMState;
     constexpr int kNThreads = Ktraits::kNThreads;
     constexpr int kNItems = Ktraits::kNItems;
     constexpr int kNRows = Ktraits::kNRows;
@@ -120,6 +138,10 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
     scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate;
     int *index = !kUseIndex ? nullptr :reinterpret_cast<int *>(params.index_ptr) + batch_id * params.seqlen;
+    input_t *ssm_states = !kReturnSSMState? nullptr :reinterpret_cast<input_t *>(params.ssm_states_ptr);
+
+    int *cu_seqlens = reinterpret_cast<int *>(params.cu_seqlens_ptr);
+    const int cu_seqlens_size = params.cu_seqlens_size;
 
     float D_val[kNRows] = {0};
     if (params.D_ptr != nullptr) {
@@ -295,6 +317,17 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                     } else {
                         out_vals[r][i] += (complex_t(thread_data[i].z, thread_data[i].w) * C_val).real_ * 2;
                     }
+
+                    if (kUseIndex && kReturnSSMState) {
+                        // this is for inference, we want to get ssm_states for all sequences.
+                        int gtok   = chunk * kChunkSize + threadIdx.x * kNItems + i;
+                        int seq_id = upper_bound_dev(cu_seqlens, cu_seqlens_size, gtok) - 1;
+                        bool is_last = (gtok == cu_seqlens[seq_id + 1] - 1);
+                        if (is_last) { 
+                            std::size_t dst_off = ((std::size_t)seq_id * params.dim + dim_id) * params.dstate + state_idx;
+                            ssm_states[dst_off] = input_t(thread_data[i].y);
+                        }
+                    }
                 }
             }
         }
@@ -345,31 +378,32 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
             BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] {
                 BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] {
                     BOOL_SWITCH(params.index_ptr != nullptr , kUseIndex, [&] {
-                        using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, kUseIndex, input_t, weight_t>;
-                        
-                        constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
-                        dim3 grid(params.batch, params.dim / kNRows);
+                        BOOL_SWITCH(params.ssm_states_ptr != nullptr , kReturnSSMState, [&] {
+                            using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, kUseIndex, kReturnSSMState, input_t, weight_t>;
+                            
+                            constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
+                            dim3 grid(params.batch, params.dim / kNRows);
 
-                        // Had to change this substantially since potentially the hip 
-                        // interface for setting kernel launch attributes is slightly different from 
-                        // cuda's. In particualar, it seems to expect a plain const void * pointer.
+                            // Had to change this substantially since potentially the hip 
+                            // interface for setting kernel launch attributes is slightly different from 
+                            // cuda's. In particualar, it seems to expect a plain const void * pointer.
 
-                        auto kernel = &selective_scan_fwd_kernel<Ktraits>;
+                            auto kernel = &selective_scan_fwd_kernel<Ktraits>;
 
-                        
-                        if (kSmemSize >= 48 * 1024) {
-                            #ifndef USE_ROCM
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                            #else
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
-                                std::cerr << "Warning (selective_scan_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
-                            #endif
-                        }
+                            if (kSmemSize >= 48 * 1024) {
+                                #ifndef USE_ROCM
+                                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                                #else
+                                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                    (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+                                    std::cerr << "Warning (selective_scan_fwd_kernel): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
+                                #endif
+                            }
 
-                        kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
-                        C10_CUDA_KERNEL_LAUNCH_CHECK();
+                            kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+                            C10_CUDA_KERNEL_LAUNCH_CHECK();
+                        });
                     });
                 });
             });
